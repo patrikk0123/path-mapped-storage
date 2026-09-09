@@ -21,6 +21,9 @@ import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.exceptions.CodecNotFoundException;
+import com.datastax.driver.core.exceptions.DriverException;
+import com.datastax.driver.core.exceptions.InvalidTypeException;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import com.datastax.driver.core.policies.ConstantReconnectionPolicy;
 import com.datastax.driver.mapping.Mapper;
@@ -892,7 +895,9 @@ public class CassandraPathDB
     public List<Reclaim> listOrphanedFiles( int limit )
     {
         Date cur = new Date();
-        long threshold = getReclaimThreshold( cur, config.getGCGracePeriodInHours() );
+        // 'deletion' is a CQL timestamp. A prepared statement validates the bound type, so
+        // the threshold must be bound as a Date and not as raw epoch millis.
+        Date threshold = new Date( getReclaimThreshold( cur, config.getGCGracePeriodInHours() ) );
         ArrayList<Reclaim> ret = new ArrayList<>();
         String baseQuery = "SELECT * FROM " + keyspace + ".reclaim WHERE partition = ? AND deletion < ?";
         PreparedStatement stmt = session.prepare( baseQuery + ( limit > 0 ? " limit ?" : "" ) + ";" );
@@ -919,12 +924,20 @@ public class CassandraPathDB
                 Result<DtxReclaim> dtxReclaims = reclaimMapper.map( result );
                 ret.addAll( dtxReclaims.all() );
             }
-            catch ( Exception e )
+            catch ( CodecNotFoundException | InvalidTypeException e )
             {
-                logger.warn( "Failed to query reclaim partition {}: {}", partition, e.getMessage() );
+                // A binding defect affects every partition. Swallowing it would disable gc
+                // silently and let reclaimable storage grow without bound.
+                throw e;
+            }
+            catch ( DriverException e )
+            {
+                // A single partition failing is survivable, the next gc run retries it.
+                logger.error( "Failed to query reclaim partition {}", partition, e );
             }
         }
-        logger.info( "List orphaned files, cur: {}, threshold: {}, limit: {}, size: {}", cur, new Date( threshold ), limit, ret.size() );
+        logger.info( "List orphaned files, cur: {}, threshold: {}, limit: {}, size: {}", cur, threshold, limit,
+                     ret.size() );
         return ret;
     }
 
